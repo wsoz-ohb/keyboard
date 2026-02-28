@@ -1,0 +1,24 @@
+# Build outputs
+*.o
+*.obj
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+
+# IDE files
+.vscode/
+.settings/
+*.uvopt
+*.uvoptx
+*.uvgui*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*~
+*.swp
+*.bak
