@@ -24,10 +24,10 @@ A production-ready, universal keyboard driver framework for embedded systems. Su
   - Auto-repeat
 
 - **🛡️ Robust Design**
-  - Hardware debouncing
-  - Thread-safe (optional lock/unlock)
-  - Ghost key prevention (matrix mode)
+  - Software debouncing
+  - Optional lock/unlock hooks for key registration
   - Multiple keys simultaneous detection
+  - Matrix raw scan support (software anti-ghosting is not built in)
 
 - **💾 Efficient Memory Management**
   - Custom memory pool (no fragmentation)
@@ -123,44 +123,124 @@ int main(void) {
 #### 2. Matrix Keyboard Example
 
 ```c
-// Hardware layer: Matrix scan functions
+#include "keyboard_driver.h"
+
+static uint8_t row_pins[4] = {0, 1, 2, 3};  // replace with your row pins
+static uint8_t col_pins[4] = {4, 5, 6, 7};  // replace with your col pins
+
+static uint8_t map_row(uint8_t logical_row) {
+#if KB_MATRIX_ROW_REVERSE
+    return (uint8_t)((4u - 1u) - logical_row);
+#else
+    return logical_row;
+#endif
+}
+
+static uint8_t map_col(uint8_t logical_col) {
+#if KB_MATRIX_COL_REVERSE
+    return (uint8_t)((4u - 1u) - logical_col);
+#else
+    return logical_col;
+#endif
+}
+
 void my_select_row(uint8_t row) {
-    gpio_write(row_pins[row], 1);  // Pull row high
+    uint8_t hw_row = map_row(row);
+    gpio_write(row_pins[hw_row], KB_MATRIX_ROW_ACTIVE_LEVEL);
 }
 
 uint8_t my_read_col(uint8_t col) {
-    return gpio_read(col_pins[col]);
+    uint8_t hw_col = map_col(col);
+    return gpio_read(col_pins[hw_col]);
 }
 
 void my_unselect_row(uint8_t row) {
-    gpio_write(row_pins[row], 0);  // Pull row low
+    uint8_t hw_row = map_row(row);
+    gpio_write(row_pins[hw_row], KB_MATRIX_ROW_IDLE_LEVEL);
 }
 
 int main(void) {
+    static const char *key_names[4][4] = {
+        {"K01", "K02", "K03", "K04"},
+        {"K05", "K06", "K07", "K08"},
+        {"K09", "K10", "K11", "K12"},
+        {"K13", "K14", "K15", "K16"}
+    };
     keyboard_control_t kb_ctl;
-
     keyboard_ops_t ops = {
         .matrix_select_row = my_select_row,
         .matrix_read_col = my_read_col,
         .matrix_unselect_row = my_unselect_row
     };
-
     keyboard_cb_t cb = { .on_event = on_key_event };
 
-    keyboard_init(&kb_ctl, &ops, &cb);
+    if (keyboard_init(&kb_ctl, &ops, &cb) != KB_OK) {
+        return -1;
+    }
 
-    // Register 4x4 matrix keys
     for (uint8_t r = 0; r < 4; r++) {
         for (uint8_t c = 0; c < 4; c++) {
-            uint16_t key_id = r * 4 + c;
-            char name[16];
-            sprintf(name, "K_%d_%d", r, c);
-            keyboard_register_matrix(r, c, name, key_id, &kb_ctl);
+            uint16_t key_id = (uint16_t)(r * 4u + c);
+            keyboard_register_matrix(r, c, key_names[r][c], key_id, &kb_ctl);
         }
     }
 
     while (1) {
-        keyboard_poll(&kb_ctl, 10);
+        keyboard_poll(&kb_ctl, 10u);
+        delay_ms(10);
+    }
+}
+```
+
+#### 3. Custom Backend Example
+
+> Note: In `KB_BACKEND_CUSTOM`, `state_buf[i]` must map to the i-th registered key.
+> And set `KB_BACKEND_MODE` to `KB_BACKEND_CUSTOM` in `keyboard_config.h`.
+
+```c
+#include <string.h>
+#include "keyboard_driver.h"
+
+#define CUSTOM_KEY_COUNT 3u
+
+// Replace this with your real scanner result: 1=pressed, 0=released
+static uint8_t hw_states[CUSTOM_KEY_COUNT] = {0u};
+
+static int my_scan_snapshot(uint8_t *state_buf, uint16_t key_count) {
+    if (state_buf == NULL || key_count != CUSTOM_KEY_COUNT) {
+        return -1;
+    }
+    memcpy(state_buf, hw_states, CUSTOM_KEY_COUNT);
+    return 0;
+}
+
+int main(void) {
+    static const keyboard_key_cfg_t keys[CUSTOM_KEY_COUNT] = {
+        {.keyname = "VOL_UP",   .key_id = 0x10u, .hw.hw_code = 0x100u},
+        {.keyname = "VOL_DOWN", .key_id = 0x11u, .hw.hw_code = 0x101u},
+        {.keyname = "MUTE",     .key_id = 0x12u, .hw.hw_code = 0x102u}
+    };
+
+    keyboard_control_t kb_ctl;
+    keyboard_ops_t ops = {
+        .scan_snapshot = my_scan_snapshot
+    };
+    keyboard_cb_t cb = {
+        .on_event = on_key_event
+    };
+
+    if (keyboard_init(&kb_ctl, &ops, &cb) != KB_OK) {
+        return -1;
+    }
+
+    for (uint8_t i = 0; i < CUSTOM_KEY_COUNT; i++) {
+        if (keyboard_register_key(&keys[i], &kb_ctl) != KB_OK) {
+            return -1;
+        }
+    }
+
+    while (1) {
+        keyboard_poll(&kb_ctl, 10u);
         delay_ms(10);
     }
 }
@@ -171,18 +251,36 @@ int main(void) {
 Edit `keyboard_config.h` to customize:
 
 ```c
+// Memory pool size (bytes)
+#define KEYBOARD_POOL_SIZE 512u
+
 // Maximum number of keys
 #define KB_MAX_KEYS 16u
 
 // Timing parameters (ms)
-#define KB_DEBOUNCE_MS 20u          // Debounce time
-#define KB_LONGPRESS_MS 800u        // Long-press threshold
-#define KB_REPEAT_START_MS 500u     // Repeat start delay
-#define KB_REPEAT_PERIOD_MS 80u     // Repeat interval
-#define KB_DOUBLE_CLICK_MS 250u     // Double-click window
+#define KB_DEBOUNCE_MS 20u
+#define KB_LONGPRESS_MS 800u
+#define KB_REPEAT_START_MS 500u
+#define KB_REPEAT_PERIOD_MS 80u
+#define KB_DOUBLE_CLICK_MS 250u
 
 // Backend mode
-#define KB_BACKEND_MODE KB_BACKEND_GPIO    // or KB_BACKEND_MATRIX
+#define KB_BACKEND_MODE KB_BACKEND_GPIO  // or KB_BACKEND_MATRIX / KB_BACKEND_CUSTOM
+
+// Active level configuration
+#define KB_GPIO_ACTIVE_LEVEL 1u
+#define KB_MATRIX_ACTIVE_LEVEL 1u
+#define KB_MATRIX_ROW_ACTIVE_LEVEL 1u
+// Derived idle level for matrix row output
+#define KB_MATRIX_ROW_IDLE_LEVEL ((KB_MATRIX_ROW_ACTIVE_LEVEL) ? 0u : 1u)
+
+// Matrix orientation flags (used by your row/col mapping callbacks)
+#define KB_MATRIX_ROW_REVERSE 0u
+#define KB_MATRIX_COL_REVERSE 0u
+
+// Matrix dimensions
+#define KB_MATRIX_MAX_ROW 8u
+#define KB_MATRIX_MAX_COL 8u
 ```
 
 ### API Reference
@@ -218,7 +316,7 @@ int keyboard_register_key(const keyboard_key_cfg_t *cfg,
 void keyboard_poll(keyboard_control_t *ctl, uint32_t dt_ms);
 ```
 
-Call this function periodically (recommended: 10ms interval).
+Call this function periodically (recommended: 10ms interval). `dt_ms` is the elapsed time since the previous call.
 
 ### Event Types
 
@@ -231,6 +329,8 @@ Call this function periodically (recommended: 10ms interval).
 | `KB_EVT_LONGPRESS` | Long press detected |
 | `KB_EVT_LONGPRESS_RELEASE` | Long press released |
 | `KB_EVT_REPEAT` | Auto-repeat event |
+
+> Note: `KB_EVT_CLICK` is emitted after `KB_DOUBLE_CLICK_MS` timeout to avoid conflict with `KB_EVT_DOUBLE_CLICK`.
 
 ### Error Codes
 
@@ -250,34 +350,52 @@ Call this function periodically (recommended: 10ms interval).
 #### Detecting Key Combinations
 
 ```c
-static uint16_t pressed_keys[8];
-static uint8_t pressed_count = 0;
+#include <string.h>
+
+#define MAX_PRESSED_KEYS 8u
+#define KEY_CTRL 0x01u  // replace with your key_id
+#define KEY_C    0x02u  // replace with your key_id
+static uint16_t pressed_keys[MAX_PRESSED_KEYS];
+static uint8_t pressed_count = 0u;
+
+static int find_pressed_index(uint16_t key_id) {
+    for (uint8_t i = 0; i < pressed_count; i++) {
+        if (pressed_keys[i] == key_id) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
 
 void on_key_event(const char *keyname, uint16_t key_id,
                   kb_event_t evt, void *user) {
-    if (evt == KB_EVT_PRESS) {
-        pressed_keys[pressed_count++] = key_id;
+    (void)keyname;
+    (void)user;
 
-        // Check for Ctrl+C (example)
-        if (pressed_count == 2) {
-            if ((pressed_keys[0] == KEY_CTRL && pressed_keys[1] == KEY_C) ||
-                (pressed_keys[0] == KEY_C && pressed_keys[1] == KEY_CTRL)) {
-                printf("Ctrl+C detected!\n");
-            }
+    if (evt == KB_EVT_PRESS) {
+        if (find_pressed_index(key_id) < 0 && pressed_count < MAX_PRESSED_KEYS) {
+            pressed_keys[pressed_count++] = key_id;
+        }
+
+        if (find_pressed_index(KEY_CTRL) >= 0 && find_pressed_index(KEY_C) >= 0) {
+            printf("Ctrl+C detected!\n");
         }
     } else if (evt == KB_EVT_RELEASE) {
-        // Remove from pressed_keys array
-        for (uint8_t i = 0; i < pressed_count; i++) {
-            if (pressed_keys[i] == key_id) {
-                memmove(&pressed_keys[i], &pressed_keys[i+1],
-                       (pressed_count - i - 1) * sizeof(uint16_t));
-                pressed_count--;
-                break;
-            }
+        int idx = find_pressed_index(key_id);
+        if (idx >= 0) {
+            memmove(&pressed_keys[idx], &pressed_keys[idx + 1],
+                    (pressed_count - (uint8_t)idx - 1u) * sizeof(pressed_keys[0]));
+            pressed_count--;
         }
     }
 }
 ```
+
+#### Matrix Ghosting Note
+
+Current matrix backend does **not** implement software anti-ghost filtering.  
+If your matrix has no per-key diodes, 3+ key rectangle presses can still produce ghost keys.  
+Use diode hardware, or add filtering in application logic / `KB_BACKEND_CUSTOM`.
 
 ### License
 
@@ -313,10 +431,10 @@ Contributions are welcome! Please feel free to submit a Pull Request.
   - 自动连发
 
 - **🛡️ 健壮的设计**
-  - 硬件防抖
-  - 线程安全（可选锁机制）
-  - 鬼键预防（矩阵模式）
+  - 软件防抖
+  - 按键注册路径支持可选 lock/unlock
   - 多键同时检测
+  - 支持矩阵原始扫描（未内置软件防鬼键）
 
 - **💾 高效内存管理**
   - 自定义内存池（无碎片）
@@ -412,44 +530,124 @@ int main(void) {
 #### 2. 矩阵键盘示例
 
 ```c
-// 硬件层：矩阵扫描函数
+#include "keyboard_driver.h"
+
+static uint8_t row_pins[4] = {0, 1, 2, 3};  // 替换为你的行引脚
+static uint8_t col_pins[4] = {4, 5, 6, 7};  // 替换为你的列引脚
+
+static uint8_t map_row(uint8_t logical_row) {
+#if KB_MATRIX_ROW_REVERSE
+    return (uint8_t)((4u - 1u) - logical_row);
+#else
+    return logical_row;
+#endif
+}
+
+static uint8_t map_col(uint8_t logical_col) {
+#if KB_MATRIX_COL_REVERSE
+    return (uint8_t)((4u - 1u) - logical_col);
+#else
+    return logical_col;
+#endif
+}
+
 void my_select_row(uint8_t row) {
-    gpio_write(row_pins[row], 1);  // 拉高行
+    uint8_t hw_row = map_row(row);
+    gpio_write(row_pins[hw_row], KB_MATRIX_ROW_ACTIVE_LEVEL);
 }
 
 uint8_t my_read_col(uint8_t col) {
-    return gpio_read(col_pins[col]);
+    uint8_t hw_col = map_col(col);
+    return gpio_read(col_pins[hw_col]);
 }
 
 void my_unselect_row(uint8_t row) {
-    gpio_write(row_pins[row], 0);  // 拉低行
+    uint8_t hw_row = map_row(row);
+    gpio_write(row_pins[hw_row], KB_MATRIX_ROW_IDLE_LEVEL);
 }
 
 int main(void) {
+    static const char *key_names[4][4] = {
+        {"K01", "K02", "K03", "K04"},
+        {"K05", "K06", "K07", "K08"},
+        {"K09", "K10", "K11", "K12"},
+        {"K13", "K14", "K15", "K16"}
+    };
     keyboard_control_t kb_ctl;
-
     keyboard_ops_t ops = {
         .matrix_select_row = my_select_row,
         .matrix_read_col = my_read_col,
         .matrix_unselect_row = my_unselect_row
     };
-
     keyboard_cb_t cb = { .on_event = on_key_event };
 
-    keyboard_init(&kb_ctl, &ops, &cb);
+    if (keyboard_init(&kb_ctl, &ops, &cb) != KB_OK) {
+        return -1;
+    }
 
-    // 注册4x4矩阵按键
     for (uint8_t r = 0; r < 4; r++) {
         for (uint8_t c = 0; c < 4; c++) {
-            uint16_t key_id = r * 4 + c;
-            char name[16];
-            sprintf(name, "K_%d_%d", r, c);
-            keyboard_register_matrix(r, c, name, key_id, &kb_ctl);
+            uint16_t key_id = (uint16_t)(r * 4u + c);
+            keyboard_register_matrix(r, c, key_names[r][c], key_id, &kb_ctl);
         }
     }
 
     while (1) {
-        keyboard_poll(&kb_ctl, 10);
+        keyboard_poll(&kb_ctl, 10u);
+        delay_ms(10);
+    }
+}
+```
+
+#### 3. 自定义后端示例
+
+> 注意：在 `KB_BACKEND_CUSTOM` 下，`state_buf[i]` 必须对应“第 i 个注册的按键”。
+> 同时在 `keyboard_config.h` 里把 `KB_BACKEND_MODE` 设为 `KB_BACKEND_CUSTOM`。
+
+```c
+#include <string.h>
+#include "keyboard_driver.h"
+
+#define CUSTOM_KEY_COUNT 3u
+
+// 替换为你的真实扫描结果：1=按下，0=释放
+static uint8_t hw_states[CUSTOM_KEY_COUNT] = {0u};
+
+static int my_scan_snapshot(uint8_t *state_buf, uint16_t key_count) {
+    if (state_buf == NULL || key_count != CUSTOM_KEY_COUNT) {
+        return -1;
+    }
+    memcpy(state_buf, hw_states, CUSTOM_KEY_COUNT);
+    return 0;
+}
+
+int main(void) {
+    static const keyboard_key_cfg_t keys[CUSTOM_KEY_COUNT] = {
+        {.keyname = "VOL_UP",   .key_id = 0x10u, .hw.hw_code = 0x100u},
+        {.keyname = "VOL_DOWN", .key_id = 0x11u, .hw.hw_code = 0x101u},
+        {.keyname = "MUTE",     .key_id = 0x12u, .hw.hw_code = 0x102u}
+    };
+
+    keyboard_control_t kb_ctl;
+    keyboard_ops_t ops = {
+        .scan_snapshot = my_scan_snapshot
+    };
+    keyboard_cb_t cb = {
+        .on_event = on_key_event
+    };
+
+    if (keyboard_init(&kb_ctl, &ops, &cb) != KB_OK) {
+        return -1;
+    }
+
+    for (uint8_t i = 0; i < CUSTOM_KEY_COUNT; i++) {
+        if (keyboard_register_key(&keys[i], &kb_ctl) != KB_OK) {
+            return -1;
+        }
+    }
+
+    while (1) {
+        keyboard_poll(&kb_ctl, 10u);
         delay_ms(10);
     }
 }
@@ -460,18 +658,36 @@ int main(void) {
 编辑 `keyboard_config.h` 进行自定义：
 
 ```c
+// 内存池大小（字节）
+#define KEYBOARD_POOL_SIZE 512u
+
 // 最大按键数量
 #define KB_MAX_KEYS 16u
 
 // 时间参数（毫秒）
-#define KB_DEBOUNCE_MS 20u          // 防抖时间
-#define KB_LONGPRESS_MS 800u        // 长按阈值
-#define KB_REPEAT_START_MS 500u     // 连发启动延迟
-#define KB_REPEAT_PERIOD_MS 80u     // 连发间隔
-#define KB_DOUBLE_CLICK_MS 250u     // 双击时间窗口
+#define KB_DEBOUNCE_MS 20u
+#define KB_LONGPRESS_MS 800u
+#define KB_REPEAT_START_MS 500u
+#define KB_REPEAT_PERIOD_MS 80u
+#define KB_DOUBLE_CLICK_MS 250u
 
 // 后端模式
-#define KB_BACKEND_MODE KB_BACKEND_GPIO    // 或 KB_BACKEND_MATRIX
+#define KB_BACKEND_MODE KB_BACKEND_GPIO  // 或 KB_BACKEND_MATRIX / KB_BACKEND_CUSTOM
+
+// 有效电平配置
+#define KB_GPIO_ACTIVE_LEVEL 1u
+#define KB_MATRIX_ACTIVE_LEVEL 1u
+#define KB_MATRIX_ROW_ACTIVE_LEVEL 1u
+// 由行选通电平推导出的空闲电平
+#define KB_MATRIX_ROW_IDLE_LEVEL ((KB_MATRIX_ROW_ACTIVE_LEVEL) ? 0u : 1u)
+
+// 矩阵方向标志（在你的行列映射回调中使用）
+#define KB_MATRIX_ROW_REVERSE 0u
+#define KB_MATRIX_COL_REVERSE 0u
+
+// 矩阵尺寸
+#define KB_MATRIX_MAX_ROW 8u
+#define KB_MATRIX_MAX_COL 8u
 ```
 
 ### API参考
@@ -507,7 +723,7 @@ int keyboard_register_key(const keyboard_key_cfg_t *cfg,
 void keyboard_poll(keyboard_control_t *ctl, uint32_t dt_ms);
 ```
 
-定期调用此函数（推荐：10ms间隔）。
+定期调用此函数（推荐：10ms间隔）。`dt_ms` 表示距离上一次调用的时间增量（毫秒）。
 
 ### 事件类型
 
@@ -520,6 +736,8 @@ void keyboard_poll(keyboard_control_t *ctl, uint32_t dt_ms);
 | `KB_EVT_LONGPRESS` | 检测到长按 |
 | `KB_EVT_LONGPRESS_RELEASE` | 长按释放 |
 | `KB_EVT_REPEAT` | 自动连发事件 |
+
+> 注意：为避免与 `KB_EVT_DOUBLE_CLICK` 冲突，`KB_EVT_CLICK` 会在 `KB_DOUBLE_CLICK_MS` 超时后才触发。
 
 ### 错误码
 
@@ -539,34 +757,52 @@ void keyboard_poll(keyboard_control_t *ctl, uint32_t dt_ms);
 #### 检测组合键
 
 ```c
-static uint16_t pressed_keys[8];
-static uint8_t pressed_count = 0;
+#include <string.h>
+
+#define MAX_PRESSED_KEYS 8u
+#define KEY_CTRL 0x01u  // 按你的 key_id 定义
+#define KEY_C    0x02u  // 按你的 key_id 定义
+static uint16_t pressed_keys[MAX_PRESSED_KEYS];
+static uint8_t pressed_count = 0u;
+
+static int find_pressed_index(uint16_t key_id) {
+    for (uint8_t i = 0; i < pressed_count; i++) {
+        if (pressed_keys[i] == key_id) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
 
 void on_key_event(const char *keyname, uint16_t key_id,
                   kb_event_t evt, void *user) {
-    if (evt == KB_EVT_PRESS) {
-        pressed_keys[pressed_count++] = key_id;
+    (void)keyname;
+    (void)user;
 
-        // 检测 Ctrl+C（示例）
-        if (pressed_count == 2) {
-            if ((pressed_keys[0] == KEY_CTRL && pressed_keys[1] == KEY_C) ||
-                (pressed_keys[0] == KEY_C && pressed_keys[1] == KEY_CTRL)) {
-                printf("检测到 Ctrl+C!\n");
-            }
+    if (evt == KB_EVT_PRESS) {
+        if (find_pressed_index(key_id) < 0 && pressed_count < MAX_PRESSED_KEYS) {
+            pressed_keys[pressed_count++] = key_id;
+        }
+
+        if (find_pressed_index(KEY_CTRL) >= 0 && find_pressed_index(KEY_C) >= 0) {
+            printf("检测到 Ctrl+C!\n");
         }
     } else if (evt == KB_EVT_RELEASE) {
-        // 从 pressed_keys 数组中移除
-        for (uint8_t i = 0; i < pressed_count; i++) {
-            if (pressed_keys[i] == key_id) {
-                memmove(&pressed_keys[i], &pressed_keys[i+1],
-                       (pressed_count - i - 1) * sizeof(uint16_t));
-                pressed_count--;
-                break;
-            }
+        int idx = find_pressed_index(key_id);
+        if (idx >= 0) {
+            memmove(&pressed_keys[idx], &pressed_keys[idx + 1],
+                    (pressed_count - (uint8_t)idx - 1u) * sizeof(pressed_keys[0]));
+            pressed_count--;
         }
     }
 }
 ```
+
+#### 矩阵鬼键说明
+
+当前矩阵后端**未内置软件防鬼键算法**。  
+如果硬件没有逐键二极管，3 键及以上构成矩形时仍可能出现鬼键。  
+建议使用逐键二极管，或在应用层 / `KB_BACKEND_CUSTOM` 中补充过滤策略。
 
 ### 许可证
 
