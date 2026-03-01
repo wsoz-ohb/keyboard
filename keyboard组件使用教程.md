@@ -1,147 +1,92 @@
 # keyboard组件使用教程
 
-> 本文档将介绍一下如何快速使用本组件进行辅助开发
+> 本文档用于快速上手 keyboard 组件（GPIO / 矩阵 / 自定义后端）
 >
-> ​																		------wsoz
+> -- wsoz
 
+## 1. 配置修改（keyboard_config.h）
 
-
-## 配置页修改
-
-在进行GPIO按键操作时，我们首先需要去` keyboard_config.h` 中切换一下我们的` KB_BACKEND_MODE` 模式以适配我们的矩阵还是GPIO按键。
+先在 `keyboard_config.h` 里选择后端模式：
 
 ```c
+/* 采集后端模式 */
+#define KB_BACKEND_GPIO   1u
+#define KB_BACKEND_MATRIX 2u
+#define KB_BACKEND_CUSTOM 3u
+
 /* 默认使用矩阵键盘，可在工程配置里覆写 */
 #ifndef KB_BACKEND_MODE
 #define KB_BACKEND_MODE KB_BACKEND_GPIO
-
-//同时注意在我们的那个按键控制块中选择
-g_key_ctl.backend_mode=KB_BACKEND_MODE;
+#endif
 ```
 
-## 初始化
+注意：`g_key_ctl.backend_mode` 不需要手动赋值，`keyboard_init()` 内部会根据 `KB_BACKEND_MODE` 自动设置。
 
-在初始化中我们主要就是将ops操作集，回调函数等绑定到`keyboard_control_t`按键控制结构体中
+---
 
-### **按键注册描述符初始化**
+## 2. 初始化总流程
+
+统一流程如下：
+
+1. 配置硬件 IO（GPIO 模式或矩阵行列模式）
+2. 填充 `keyboard_ops_t` 和 `keyboard_cb_t`
+3. 调用 `keyboard_init(&ctl, &ops, &cb)`
+4. 注册按键（`keyboard_register_gpio/matrix` 或 `keyboard_register_key`）
+5. 周期调用 `keyboard_poll(&ctl, dt_ms)`
+
+---
+
+## 3. 按键描述符（keyboard_key_cfg_t）
 
 ```c
 typedef struct
 {
     const char *keyname;      /* 逻辑名称，如 "K_A" */
-    uint16_t key_id;          /* 逻辑按键ID，业务层推荐用这个 */
+    uint16_t key_id;          /* 逻辑按键ID，应用层推荐用这个 */
     keyboard_hw_ref_t hw;     /* 硬件定位信息 */
 } keyboard_key_cfg_t;
 
-/* 硬件定位：独立 GPIO / 矩阵 row-col / 自定义编码 */
 typedef union
 {
-    uint8_t gpio_pin;
-    keyboard_matrix_pos_t matrix;
-    uint16_t hw_code;
+    uint8_t gpio_pin;         /* GPIO 模式 */
+    keyboard_matrix_pos_t matrix; /* 矩阵模式 */
+    uint16_t hw_code;         /* 自定义模式 */
 } keyboard_hw_ref_t;
-
-/* 矩阵键盘位置 */
-typedef struct
-{
-    uint8_t row;
-    uint8_t col;
-} keyboard_matrix_pos_t;
-
-keyboard_key_cfg_t cfg={0};
 ```
 
-争对GPIO按键以及矩阵按键初始化不同
+- GPIO 模式：只填 `cfg.hw.gpio_pin`
+- 矩阵模式：只填 `cfg.hw.matrix.row/col`
+- 自定义模式：只填 `cfg.hw.hw_code`
+
+---
+
+## 4. 操作集（keyboard_ops_t）
 
 ```c
-/*通用*/
-cfg.keyname="name";
-cfg.key_id=pin_id;	//此处即是按键的一个区分符,逻辑标识应用层回调解析使用
+keyboard_ops_t ops = {0};
+```
 
-/*GPIO*/
-cfg.hw.gpio_pin=pin_num;	//这个按键对应的“硬件引脚编号”，驱动层去读取的引脚
-/* 4*4为例子矩阵键盘 */	行列坐标
-static const char *name_4x4[4][4] = {
-    {"K01","K02","K03","K04"},
-    {"K05","K06","K07","K08"},
-    {"K09","K10","K11","K12"},
-    {"K13","K14","K15","K16"},
-};
+### 4.1 GPIO 模式
 
-for (uint8_t r = 0; r < 4; r++) {
-    for (uint8_t c = 0; c < 4; c++) {
-        keyboard_key_cfg_t cfg = {0};
-        cfg.keyname = name_4x4[r][c];
-        cfg.key_id = (uint16_t)(r * 4u + c + 1u);
-        cfg.hw.matrix.row = r;
-        cfg.hw.matrix.col = c;
-        keyboard_register_key(&cfg, &g_key_ctl);
-    }
+```c
+static uint8_t read_pin_level(uint8_t pin)
+{
+    return (uint8_t)rt_pin_read((rt_base_t)pin);
 }
 
-/* 推荐使用便捷接口 */
-static const char *name_4x4[4][4] = {
-    {"K01","K02","K03","K04"},
-    {"K05","K06","K07","K08"},
-    {"K09","K10","K11","K12"},
-    {"K13","K14","K15","K16"},
+ops.read_pin = read_pin_level;
+```
+
+### 4.2 矩阵模式（RT-Thread 示例）
+
+```c
+static const rt_base_t row_pins[4] = {
+    GET_PIN(E,9), GET_PIN(E,10), GET_PIN(E,11), GET_PIN(E,12)
 };
 
-for (uint8_t r = 0; r < 4; r++) {
-    for (uint8_t c = 0; c < 4; c++) {
-        uint16_t key_id = (uint16_t)(r * 4u + c + 1u); // 1~16
-        keyboard_register_matrix(r, c, name_4x4[r][c], key_id, &g_key_ctl);
-    }
-}
-```
-
-### **硬件操作集初始化**
-
-接下来就需要去对接我们的ops操作集合
-
-```c
-/* keyboard 操作集 */
-typedef struct
-{
-    /* GPIO 后端：读取 pin 电平，返回 0/1 */
-    uint8_t (*read_pin)(uint8_t pin);
-
-    /* 矩阵后端：驱动行并读取列 */
-    void (*matrix_select_row)(uint8_t row);
-    uint8_t (*matrix_read_col)(uint8_t col);
-    void (*matrix_unselect_row)(uint8_t row);
-
-    /*
-     * 自定义后端（复杂输入建议使用）：
-     * 按“注册顺序”输出 key_count 个按键电平到 state_buf（每个元素取值0/1）
-     * 返回 0 表示成功
-     */
-    int (*scan_snapshot)(uint8_t *state_buf, uint16_t key_count);
-
-    /* 获取当前毫秒 tick（可选，不提供则可以依赖 poll 的 dt_ms） */
-    uint32_t (*get_tick_ms)(void);
-
-    /* 可选：多线程环境保护 */
-    void (*lock)(void);
-    void (*unlock)(void);
-} keyboard_ops_t;
-
-keyboard_ops_t ops={0};
-```
-
-下面争对我们的GPIO以及矩阵键盘进行讲解
-
-```c
-/*GPIO*/
-ops.read_pin=read_pin_level;	//注意需要和函数指针声明相同
-
-/*矩阵键盘*/
-示例（RT-Thread）：
-
-static const rt_base_t row_pins[4] = { GET_PIN(E,9), GET_PIN(E,10),
-GET_PIN(E,11), GET_PIN(E,12) };
-static const rt_base_t col_pins[4] = { GET_PIN(B,0), GET_PIN(B,1), GET_PIN(E,7),
-GET_PIN(E,8)  };
+static const rt_base_t col_pins[4] = {
+    GET_PIN(B,0), GET_PIN(B,1), GET_PIN(E,7), GET_PIN(E,8)
+};
 
 static void kb_select_row(uint8_t row)
 {
@@ -157,78 +102,155 @@ static void kb_unselect_row(uint8_t row)
 {
     rt_pin_write(row_pins[row], KB_MATRIX_ROW_IDLE_LEVEL);
 }
+
 keyboard_ops_t ops = {
     .matrix_select_row   = kb_select_row,
     .matrix_read_col     = kb_read_col,
-    .matrix_unselect_row = kb_unselect_row
-        // 下面可选
-    .lock = RT_NULL,
-    .unlock = RT_NULL
-    .get_tick_ms = RT_NULL,
-}
+    .matrix_unselect_row = kb_unselect_row,
+    .lock                = RT_NULL,   /* 可选 */
+    .unlock              = RT_NULL,   /* 可选 */
+    .get_tick_ms         = RT_NULL    /* 可选 */
+};
 ```
 
-### 回调函数初始化
+---
 
-我们的应用层主要通过回调函数来处理对应的事件完成按键任务。
-
-```c
-typedef struct
-{
-    keyboard_event_cb on_event;
-    void *user;
-} keyboard_cb_t;
-
-keyboard_cb_t cb={0}；
-```
-
-按键的回调函数定义格式：
+## 5. 回调函数（keyboard_cb_t）
 
 ```c
-static void kb_event_cb(const char *keyname, uint16_t key_id, kb_event_t evt,void *user)
+static void kb_event_cb(const char *keyname, uint16_t key_id, kb_event_t evt, void *user)
 {
     rt_kprintf("key=%s id=%d evt=%d\n", keyname, key_id, evt);
 }
-cb.on_event=kb_event_cb;
+
+keyboard_cb_t cb = {0};
+cb.on_event = kb_event_cb;
+cb.user = RT_NULL;
 ```
 
-在此回调函数中我们就可以通过`switch-case`等来对`key_id`以及`evt`进行分层处理,具体事件的定义可以去.h文件中参考`kb_event_t`。
+---
 
+## 6. 注册与挂载
 
-
-### 系统挂载初始化
-
-我们在完成上述操作之后就已经完成了那个基础的按键定义了，现在要做的就是完成将我们已经定义了按键挂载在我们的整个按键控制块上。
+### 6.1 GPIO 单按键示例
 
 ```c
-/*首先将ops操作集以及回调函数挂载到控制结构体*/
+keyboard_control_t g_key_ctl = {0};
+keyboard_ops_t ops = {0};
+keyboard_cb_t cb = {0};
+
+rt_base_t pin_num = rt_pin_get("PA.0");
+rt_pin_mode(pin_num, PIN_MODE_INPUT_PULLDOWN); /* 按下高电平时常用 */
+
+ops.read_pin = read_pin_level;
+cb.on_event = kb_event_cb;
+
+keyboard_init(&g_key_ctl, &ops, &cb);
+keyboard_register_gpio((uint8_t)pin_num, "K1", 1u, &g_key_ctl);
+```
+
+### 6.2 4x4 矩阵示例
+
+```c
+static const char *name_4x4[4][4] = {
+    {"K01","K02","K03","K04"},
+    {"K05","K06","K07","K08"},
+    {"K09","K10","K11","K12"},
+    {"K13","K14","K15","K16"},
+};
+
+keyboard_control_t g_key_ctl = {0};
+keyboard_ops_t ops = {0};
+keyboard_cb_t cb = {0};
+
+/* 1) 先初始化行列IO */
+for (uint8_t r = 0; r < 4; r++) {
+    rt_pin_mode(row_pins[r], PIN_MODE_OUTPUT);
+    rt_pin_write(row_pins[r], KB_MATRIX_ROW_IDLE_LEVEL);
+}
+
+#if (KB_MATRIX_ACTIVE_LEVEL == 1u)
+for (uint8_t c = 0; c < 4; c++) {
+    rt_pin_mode(col_pins[c], PIN_MODE_INPUT_PULLDOWN);
+}
+#else
+for (uint8_t c = 0; c < 4; c++) {
+    rt_pin_mode(col_pins[c], PIN_MODE_INPUT_PULLUP);
+}
+#endif
+
+/* 2) ops/cb */
+ops.matrix_select_row = kb_select_row;
+ops.matrix_read_col = kb_read_col;
+ops.matrix_unselect_row = kb_unselect_row;
+cb.on_event = kb_event_cb;
+
+/* 3) init */
 keyboard_init(&g_key_ctl, &ops, &cb);
 
-/*然后将cfg按键描述挂载到控制结构体*/
-keyboard_register_key(&cfg,&g_key_ctl);
-```
-
-
-
-## 系统运行
-
-按键初始化完成之后我们就可以运行我们的按键控制系统了。
-
-```c
-/*运行按键*/
-keyboard_poll(&g_key_ctl, 10u)
-//注意:第二个参数即是我们实际调用轮询的周期以stm32hal库为例子
-static uint32_t tick=hal_get_tick();
-static uint32_t last_tick;
-if(tick-last_tick>dt)
-{
-	keyboard_poll(&g_key_ctl, dt);
-    last_tick=tick;
+/* 4) register */
+for (uint8_t r = 0; r < 4; r++) {
+    for (uint8_t c = 0; c < 4; c++) {
+        uint16_t key_id = (uint16_t)(r * 4u + c + 1u);
+        keyboard_register_matrix(r, c, name_4x4[r][c], key_id, &g_key_ctl);
+    }
 }
 ```
 
+> 先 `keyboard_init`，再注册按键；不要在矩阵循环注册后再额外注册一个未填完整的 `cfg`。
 
+---
 
-## TIPS
+## 7. 系统运行（轮询）
 
-如果对按键的灵敏性有要求的可以去`config`中手动修改阈值时间等。
+### 7.1 固定周期（推荐）
+
+```c
+while (1)
+{
+    keyboard_poll(&g_key_ctl, 10u);
+    rt_thread_mdelay(10);
+}
+```
+
+### 7.2 非固定周期（裸机常见）
+
+```c
+uint32_t last_tick = hal_get_tick();
+while (1)
+{
+    uint32_t now = hal_get_tick();
+    uint32_t dt = now - last_tick;
+    if (dt > 0u)
+    {
+        keyboard_poll(&g_key_ctl, dt);
+        last_tick = now;
+    }
+}
+```
+
+`dt_ms` 的含义是“距离上一次 `keyboard_poll` 的时间增量（ms）”。
+
+---
+
+## 8. 常见坑（建议先看）
+
+1. `ops` / `cb` 是结构体，不是函数指针本体：
+   - 正确：`ops.read_pin = read_pin_level;`
+   - 正确：`cb.on_event = kb_event_cb;`
+2. GPIO pin 请用 `rt_pin_get("PA.0")` 的返回值，不要手写常量。
+3. 矩阵模式要先配置行列 GPIO 方向和上下拉。
+4. `KB_EVT_CLICK` 为避免和双击冲突，会在 `KB_DOUBLE_CLICK_MS` 超时后发出。
+5. 当前矩阵后端未内置软件防鬼键；无二极管矩阵在多键下可能出现鬼键。
+
+---
+
+## 9. TIPS
+
+若对手感有要求，可在 `keyboard_config.h` 调整以下参数：
+
+- `KB_DEBOUNCE_MS`
+- `KB_LONGPRESS_MS`
+- `KB_REPEAT_START_MS`
+- `KB_REPEAT_PERIOD_MS`
+- `KB_DOUBLE_CLICK_MS`
